@@ -4,6 +4,13 @@
 # Put parameters here that don't need to change on each machine where the app is deployed
 # https://symfony.com/doc/current/best_practices.html#use-parameters-for-application-configuration
 parameters:
+    crm.api_url: '%env(API_URL)%'
+    crm.api_key: '%env(API_KEY)%'
+
+    crm.state_field: 'message_state'
+    crm.date_fields: { 'cita': 'hora', 'fc2': 'hc2', 'fc3': 'hc3', 'fc4': 'hc4' }
+
+    app.since_id_file: "../lastSinceId"
 
 services:
     # default configuration for services in *this* file

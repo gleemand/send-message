@@ -2,81 +2,128 @@
 
 namespace App\Service;
 
-use RetailCrm\Api\Interfaces\ClientFactoryInterface;
-use RetailCrm\Api\Model\Entity\Customers\CustomerHistory;
-use RetailCrm\Api\Model\Entity\Orders\OrderHistory;
-use Symfony\Component\DependencyInjection\ParameterBag\ContainerBagInterface;
+use DateTime;
+use Psr\Log\LoggerInterface;
+use RetailCrm\Api\Client;
 use RetailCrm\Api\Factory\SimpleClientFactory;
+use RetailCrm\Api\Interfaces\ClientFactory;
+use RetailCrm\Api\Model\Entity\Orders\Order;
+use Symfony\Component\DependencyInjection\ParameterBag\ContainerBagInterface;
 use RetailCrm\Api\Interfaces\ApiExceptionInterface;
-use RetailCrm\Api\Model\Filter\Orders\OrderHistoryFilterV4Type;
-use RetailCrm\Api\Model\Request\Orders\OrdersHistoryRequest;
+use RetailCrm\Api\Enum\ByIdentifier;
+use RetailCrm\Api\Model\Filter\Orders\OrderFilter;
+use RetailCrm\Api\Model\Request\Orders\OrdersRequest;
+use RetailCrm\Api\Model\Request\Orders\OrdersEditRequest;
 
-class HistoryService
+class CrmApiService
 {
     private ContainerBagInterface $params;
 
-    private ClientFactoryInterface $client;
+    private Client $client;
 
-    private SinceIdService $sinceId;
+    private LoggerInterface $logger;
 
-    public function __construct(ContainerBagInterface $params, ClientFactoryInterface $client, SinceIdService $sinceId)
-    {
+    public function __construct(
+        ContainerBagInterface $params,
+        LoggerInterface $logger
+    ) {
         $this->params = $params;
-        $this->client = $client;
-        $this->sinceId = $sinceId;
+        $this->logger = $logger;
 
-        $this->client->createClient($this->params->get('crm.url'), $this->params->get('crm.api_key'));
+        $apiUrl = $this->params->get('crm.api_url');
+        $apiKey = $this->params->get('crm.api_key');
+
+        $this->client = SimpleClientFactory::createClient($apiUrl, $apiKey);
     }
 
-    public function getHistory()
+    public function getOrders(DateTime $date, string $dateField)
     {
-        $request                  = new OrdersHistoryRequest();
-        $request->limit           = 100;
-        $request->page            = 1;
-        $request->filter          = new OrderHistoryFilterV4Type();
-        $request->filter->sinceId = $this->sinceId->getSinceId();
+        $stateField = $this->params->get('crm.state_field');
+
+        $request = new OrdersRequest();
+        $request->limit = 20;
+        $request->page = 1;
+
+        $request->filter = new OrderFilter();
+        $request->filter->customFields = [
+            $dateField => [
+                'min' => $date->format('Y-m-d'),
+                'max' => $date->format('Y-m-d'),
+            ],
+            $stateField => 'new',
+        ];
 
         do {
             time_nanosleep(0, 100000000); // 10 requests per second
 
             try {
-                $response = $this->client->orders->history($request);
+                $response = $this->client->orders->list($request);
             } catch (ApiExceptionInterface $exception) {
-                echo sprintf(
+                $this->logger->error(__METHOD__ . ': ' . sprintf(
                     'Error from RetailCRM API (status code: %d): %s',
                     $exception->getStatusCode(),
                     $exception->getMessage()
-                );
+                ));
 
-                return;
+                if (count($exception->getErrorResponse()->errors) > 0) {
+                    $this->logger->error(__METHOD__ . ': ' . 'Errors: ' . implode(
+                        ', ',
+                        $exception->getErrorResponse()->errors
+                    ));
+                }
+
+                return false;
             }
 
-            if (empty($response->history)) {
+            if (empty($response->orders)) {
                 break;
             }
 
-            foreach ($response->history as $change) {
-                if ($this->filterHistory($change)) {
-                    yield $change;
-                }
+            foreach ($response->orders as $order) {
+                $this->logger->debug(__METHOD__ . ': ' . 'yield order #' . $order->id);
+
+                yield $order;
             }
 
-            $newSinceId = end($response->history)->id;
-            $request->filter->sinceId = $newSinceId;
-            $this->sinceId->setSinceId($newSinceId);
+            ++$request->page;
         } while ($response->pagination->currentPage < $response->pagination->totalPageCount);
     }
 
-    private function filterHistory($change): bool
+    public function setStateToOrder($processedOrder, $state)
     {
-        return !$change->deleted
-            && (
-                in_array($change->field, array_merge([
-                    $this->params->get('crm.date_field'),
-                    $this->params->get('crm.time_fields'),
-                    $this->params->get('crm.tracked_fields')
-                ]), true)
-                || $change->created
-            );
+        $stateField = $this->params->get('crm.state_field');
+
+        $order                 = new Order();
+        $order->customFields   = [
+            $stateField => $state
+        ];
+
+        $request        = new OrdersEditRequest();
+        $request->by    = ByIdentifier::ID;
+        $request->site  = $processedOrder->site;
+        $request->order = $order;
+
+        try {
+            $response = $this->client->orders->edit($processedOrder->id, $request);
+        } catch (ApiExceptionInterface $exception) {
+            $this->logger->error(__METHOD__ . ': ' . sprintf(
+                    'Error from RetailCRM API (status code: %d): %s',
+                    $exception->getStatusCode(),
+                    $exception->getMessage()
+                ));
+
+            if (count($exception->getErrorResponse()->errors) > 0) {
+                $this->logger->error(__METHOD__ . ': ' . 'Errors: ' . implode(
+                        ', ',
+                        $exception->getErrorResponse()->errors
+                    ));
+            }
+
+            return false;
+        }
+
+        $this->logger->debug(__METHOD__ . ': ' . 'order: ' . $response->order->id);
+
+        return true;
     }
 }
